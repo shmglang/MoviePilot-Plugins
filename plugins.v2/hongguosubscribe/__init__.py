@@ -777,11 +777,11 @@ class HongGuoSubscribe(_PluginBase):
             return self.__search_download(title)
         if self._action == "subscribe":
             return self.__try_subscribe(meta, title)
-        # auto：先尝试订阅，识别失败回退搜索下载
+        # auto：先尝试订阅，识别失败或订阅失败时回退搜索下载
         sub_result = self.__try_subscribe(meta, title)
-        if sub_result != "识别失败":
-            return sub_result
-        return self.__search_download(title)
+        if sub_result.startswith(("识别失败", "订阅失败")):
+            return self.__search_download(title)
+        return sub_result
 
     def __try_subscribe(self, meta: MetaInfo, title: str) -> str:
         """
