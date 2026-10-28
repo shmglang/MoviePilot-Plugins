@@ -5,7 +5,7 @@
     "labels": "示例",
     "version": "1.1.7",
     "icon": "douban.png",
-    "author": "WChangFei",
+    "author": "shmglang",
     "level": 1
   },
   "PlexComplete": {
@@ -14,7 +14,7 @@
     "labels": "示例",
     "version": "1.1.7",
     "icon": "movie.jpg",
-    "author": "PlexComplete",
+    "author": "shmglang",
     "level": 1
   }
 }

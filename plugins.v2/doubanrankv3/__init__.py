@@ -32,9 +32,9 @@ class DoubanRankV3(_PluginBase):
     # 插件版本
     plugin_version = "1.1.7"
     # 插件作者
-    plugin_author = "WChangFei"
+    plugin_author = "shmglang"
     # 作者主页
-    author_url = "https://github.com/WChangFei"
+    author_url = "https://github.com/shmglang"
     # 插件配置项ID前缀
     plugin_config_prefix = "doubanrankv3_"
     # 加载顺序
