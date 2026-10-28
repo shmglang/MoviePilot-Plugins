@@ -669,6 +669,37 @@ class HongGuoSubscribe(_PluginBase):
         # 缓存只清理一次
         self._clearflag = False
 
+    @staticmethod
+    def __extract_rank_list(obj: Any, depth: int = 0) -> List[dict]:
+        """
+        递归从路由数据中提取 rankList，兼容字符串内嵌 JSON
+        """
+        if depth > 8:
+            return []
+        if isinstance(obj, dict):
+            rl = obj.get("rankList")
+            if isinstance(rl, list) and rl:
+                return rl
+            for v in obj.values():
+                r = HongGuoSubscribe.__extract_rank_list(v, depth + 1)
+                if r:
+                    return r
+        elif isinstance(obj, list):
+            for v in obj:
+                r = HongGuoSubscribe.__extract_rank_list(v, depth + 1)
+                if r:
+                    return r
+        elif isinstance(obj, str):
+            s = obj.strip()
+            if s.startswith(("{", "[")):
+                try:
+                    return HongGuoSubscribe.__extract_rank_list(
+                        json.loads(s), depth + 1
+                    )
+                except Exception:
+                    pass
+        return []
+
     def __get_rank_list(self, addr: str) -> List[dict]:
         """
         获取榜单条目
@@ -684,16 +715,19 @@ class HongGuoSubscribe(_PluginBase):
                 )
                 return []
             page_text = html.unescape(res.text)
-            # 首选解析：页面内嵌结构化 JSON（data-fn-args）
-            fn_args = re.search(r"data-fn-args='(.*?)'", res.text)
+            # 首选解析：页面内嵌结构化 JSON（data-fn-args，站点为双引号+HTML实体包裹）
+            fn_args = re.search(r"data-fn-args=(\"[^\"]*\"|'[^']*')", res.text, re.S)
             if fn_args:
                 try:
-                    args = json.loads(html.unescape(fn_args.group(1)))
-                    data = args[2] if len(args) >= 3 else args[0]
-                    rank_list = data.get("rankList") or []
+                    args = json.loads(html.unescape(fn_args.group(1)[1:-1]))
+                    rank_list = self.__extract_rank_list(args)
+                    if not rank_list:
+                        raise ValueError("rankList为空")
                     items = []
                     for rk in rank_list:
-                        sid = str(rk.get("seriesId") or "")
+                        if not isinstance(rk, dict):
+                            continue
+                        sid = str(rk.get("seriesId") or rk.get("id") or "")
                         title = (rk.get("title") or "").strip()
                         if not sid or not title:
                             continue
