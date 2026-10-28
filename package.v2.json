@@ -1,5 +1,5 @@
 {
-  "HongGuoSubscribe": {
+  "hongguosubscribe": {
     "name": "红果短剧订阅",
     "description": "定时从红果短剧网站获取短剧榜单，自动搜索并下载或订阅短剧",
     "labels": "短剧",
