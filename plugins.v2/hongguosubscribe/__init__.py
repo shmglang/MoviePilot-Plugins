@@ -1,5 +1,6 @@
 import datetime
 import html
+import json
 import re
 from threading import Event
 from typing import Tuple, List, Dict, Any
@@ -683,6 +684,36 @@ class HongGuoSubscribe(_PluginBase):
                 )
                 return []
             page_text = html.unescape(res.text)
+            # 首选解析：页面内嵌结构化 JSON（data-fn-args）
+            fn_args = re.search(r"data-fn-args='(.*?)'", res.text)
+            if fn_args:
+                try:
+                    args = json.loads(html.unescape(fn_args.group(1)))
+                    data = args[2] if len(args) >= 3 else args[0]
+                    rank_list = data.get("rankList") or []
+                    items = []
+                    for rk in rank_list:
+                        sid = str(rk.get("seriesId") or "")
+                        title = (rk.get("title") or "").strip()
+                        if not sid or not title:
+                            continue
+                        item = {"series_id": sid, "title": title, "addr": addr}
+                        mh = re.search(
+                            r"(\d+(?:\.\d+)?)", rk.get("heatText") or ""
+                        )
+                        item["heat"] = float(mh.group(1)) if mh else 0
+                        mv = re.search(
+                            r"(\d+(?:\.\d+)?)", rk.get("scoreText") or ""
+                        )
+                        item["vote"] = float(mv.group(1)) if mv else 0
+                        items.append(item)
+                    if items:
+                        logger.info(
+                            f"榜单地址：{addr} ，JSON解析到 {len(items)} 条"
+                        )
+                        return items
+                except Exception as e:
+                    logger.warn(f"JSON解析失败，回退HTML解析：{e}")
             # 匹配标题与详情ID（红果短剧榜单页：<h2 id="rank-title-{series_id}">标题</h2>）
             items = []
             seen = set()
