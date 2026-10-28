@@ -1,7 +1,10 @@
 import datetime
 import difflib
+import fcntl
+import functools
 import html
 import json
+import os
 import re
 import traceback
 from threading import Event
@@ -24,6 +27,36 @@ from app.schemas.types import MediaType
 from app.utils.http import RequestUtils
 
 
+def _single_instance(func):
+    """
+    跨进程互斥装饰器：同一时刻只允许一个插件实例执行，
+    防止插件被多次初始化/调度时并发运行导致重复下载与历史互相覆盖。
+    """
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        lock_path = os.path.join(settings.CONFIG_PATH, "hongguosubscribe.lock")
+        lock_fd = None
+        try:
+            lock_fd = open(lock_path, "w")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            logger.info("红果短剧订阅已有实例正在运行，本轮跳过")
+            if lock_fd:
+                lock_fd.close()
+            return
+        try:
+            return func(self, *args, **kwargs)
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lock_fd.close()
+
+    return wrapper
+
+
 class HongGuoSubscribe(_PluginBase):
     # 插件名称
     plugin_name = "红果短剧订阅"
@@ -32,7 +65,7 @@ class HongGuoSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "hongguo.png"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     # 插件作者
     plugin_author = "shmglang"
     # 作者主页
@@ -568,6 +601,7 @@ class HongGuoSubscribe(_PluginBase):
             }
         )
 
+    @_single_instance
     def __refresh(self):
         """
         刷新红果短剧榜单
@@ -670,8 +704,16 @@ class HongGuoSubscribe(_PluginBase):
             except Exception as e:
                 logger.error(str(e))
 
-        # 保存历史记录
-        self.save_data("history", history)
+        # 保存历史记录：读取最新数据合并去重后写入，防止并发实例互相覆盖丢失
+        try:
+            latest = self.get_data("history") or []
+            merged = {h.get("unique"): h for h in latest}
+            for h in history:
+                merged[h.get("unique")] = h
+            self.save_data("history", list(merged.values()))
+        except Exception as e:
+            logger.error(f"合并保存历史记录失败：{str(e)}，回退直接保存")
+            self.save_data("history", history)
         # 缓存只清理一次
         self._clearflag = False
 
