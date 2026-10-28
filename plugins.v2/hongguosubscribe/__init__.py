@@ -599,6 +599,9 @@ class HongGuoSubscribe(_PluginBase):
                     continue
                 else:
                     logger.info(f"榜单地址：{addr} ，共 {len(rank_items)} 条数据")
+                # 仅处理热播榜前10条
+                rank_items = rank_items[:10]
+                logger.info(f"榜单地址：{addr} ，处理前 {len(rank_items)} 条")
                 for idx, item in enumerate(rank_items, 1):
                     try:
                         if self._event.is_set():
