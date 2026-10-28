@@ -1,4 +1,5 @@
 import datetime
+import difflib
 import html
 import json
 import re
@@ -15,8 +16,10 @@ from app.chain.search import SearchChain
 from app.chain.subscribe import SubscribeChain
 from app.core.config import settings
 from app.core.metainfo import MetaInfo
+from app.domain.context import MediaInfo
 from app.log import logger
 from app.plugins import _PluginBase
+from app.schemas.types import MediaType
 from app.utils.http import RequestUtils
 
 
@@ -28,7 +31,7 @@ class HongGuoSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "hongguo.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "shmglang"
     # 作者主页
@@ -841,7 +844,7 @@ class HongGuoSubscribe(_PluginBase):
             logger.info(f"{mediainfo.title_year} 订阅已存在")
             return "订阅已存在"
         # 添加订阅
-        subscribechain.add(
+        sub_id, sub_err = subscribechain.add(
             title=mediainfo.title,
             year=mediainfo.year,
             mtype=mediainfo.type,
@@ -850,6 +853,9 @@ class HongGuoSubscribe(_PluginBase):
             exist_ok=True,
             username="红果短剧",
         )
+        if not sub_id:
+            logger.warn(f"订阅添加失败：{sub_err}：{mediainfo.title_year}")
+            return f"订阅失败：{sub_err or '未知原因'}"
         logger.info(f"已添加订阅：{mediainfo.title_year}")
         return "已订阅"
 
@@ -862,10 +868,70 @@ class HongGuoSubscribe(_PluginBase):
         if not contexts:
             logger.warn(f"{title} 未搜索到资源")
             return "未搜索到资源"
-        # 优先下载体积最大的资源
-        contexts.sort(key=lambda c: c.torrent_info.size or 0, reverse=True)
-        context = contexts[0]
+        # 过滤无种子信息的空壳结果
+        valid = [c for c in contexts if getattr(c, "torrent_info", None)]
+        if not valid:
+            logger.warn(f"{title} 搜索结果均为空壳（无种子信息）")
+            return "未搜索到有效资源"
+        # 标题相关度匹配：优先选标题与搜索词相关的资源
+        # 归一化：去除空白、括号、中英文标点（逗号/句号/感叹号/问号/顿号等），
+        # 避免“婆婆装瘫七年，我高调离婚！”的拼音串残留中文逗号导致匹配失败
+        _PUNCT = r"[\s:：·\-_\[\]（）()【】,，。!！?？、;；'\"“”‘’…~～/\\|]"
+        def _norm(s: str) -> str:
+            return re.sub(_PUNCT, "", s or "").lower()
+
+        base = _norm(title)
+        # 中文转拼音全拼（用于匹配拼音/英文种子标题，如 Bei Yong Lian Xi Ren Wan）
+        try:
+            from pypinyin import lazy_pinyin
+            py_list = lazy_pinyin(title)
+            base_py = "".join(py_list).lower()
+            # 拼音全拼同样过滤标点（lazy_pinyin 会保留中文标点字符）
+            base_py = re.sub(_PUNCT, "", base_py)
+            initials = re.sub(
+                r"[^a-z]", "", "".join([p[0] for p in py_list]).lower()
+            )
+        except Exception:
+            base_py, initials = "", ""
+        scored = []
+        for c in valid:
+            t = _norm(getattr(c.torrent_info, "title", ""))
+            # 中文标题包含匹配（如种子标题含中文剧名）
+            hit = 1.0 if (base and base in t) else 0.0
+            # 拼音全拼匹配：搜索词拼音是种子标题拼音的子串（如 helihouwodainv...）
+            if hit <= 0 and len(base_py) >= 4 and base_py in t:
+                hit = max(hit, 0.9)
+            # 拼音首字母匹配：搜索词拼音首字母是种子标题子串（如 hlhwodnv...）
+            if hit <= 0 and len(initials) >= 3 and initials in t:
+                hit = max(hit, 0.7)
+            # difflib 相似度兜底
+            if hit <= 0:
+                ratio = difflib.SequenceMatcher(None, base, t).ratio()
+                if ratio >= 0.6 or (base and t and (base[:2] in t or t[:2] in base)):
+                    hit = max(hit, ratio)
+            scored.append((hit, c.torrent_info.size or 0, c))
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        best_hit = scored[0][0]
+        if best_hit <= 0:
+            logger.warn(f"{title} 未找到标题匹配的资源，跳过下载（避免误下不相关资源）")
+            return "未找到匹配资源"
+        context = scored[0][2]
+        # 补全媒体与元数据（search_by_title 不识别媒体信息，download_single 校验三字段齐全）
+        if not context.meta_info:
+            context.meta_info = MetaInfo(title)
+        if not context.media_info:
+            media_type = context.meta_info.type
+            context.media_info = MediaInfo(
+                type=media_type.value if media_type and media_type != MediaType.UNKNOWN else MediaType.TV.value,
+                title=context.meta_info.cn_name or context.meta_info.name or title,
+                year=str(context.meta_info.year) if context.meta_info.year else None,
+            )
         # 下载
-        DownloadChain().download_single(context=context)
+        result = DownloadChain().download_single(context=context, return_detail=True)
+        if isinstance(result, tuple):
+            save_path, err_msg = result
+            if not save_path:
+                logger.error(f"下载失败：{err_msg}：{context.torrent_info.title}")
+                return f"下载失败：{err_msg or '未知原因'}"
         logger.info(f"已开始下载：{context.torrent_info.title}")
         return "已开始下载"
