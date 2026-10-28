@@ -3,6 +3,7 @@ import difflib
 import html
 import json
 import re
+import traceback
 from threading import Event
 from typing import Tuple, List, Dict, Any
 
@@ -661,7 +662,9 @@ class HongGuoSubscribe(_PluginBase):
                             }
                         )
                     except Exception as e:
-                        logger.error(f"处理榜单条目时出错: {str(e)}")
+                        logger.error(
+                            f"处理榜单条目时出错: {str(e)}\n{traceback.format_exc()}"
+                        )
                         continue
                 logger.info(f"榜单地址：{addr} 处理完成")
             except Exception as e:
@@ -922,14 +925,14 @@ class HongGuoSubscribe(_PluginBase):
         if not context.media_info:
             media_type = context.meta_info.type
             # meta_info.type 可能是 MediaType 枚举或字符串（如 "电视剧"/"电影"），兼容处理
-            if isinstance(media_type, MediaType):
-                media_type_value = media_type.value
+            if isinstance(media_type, MediaType) and media_type != MediaType.UNKNOWN:
+                media_type_obj = media_type
             elif media_type and str(media_type) in [t.value for t in MediaType]:
-                media_type_value = str(media_type)
+                media_type_obj = MediaType(str(media_type))
             else:
-                media_type_value = MediaType.TV.value
+                media_type_obj = MediaType.TV
             context.media_info = MediaInfo(
-                type=media_type_value,
+                type=media_type_obj,
                 title=context.meta_info.cn_name or context.meta_info.name or title,
                 year=str(context.meta_info.year) if context.meta_info.year else None,
             )
