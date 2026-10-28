@@ -65,7 +65,7 @@ class HongGuoSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "hongguo.png"
     # 插件版本
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     # 插件作者
     plugin_author = "shmglang"
     # 作者主页
@@ -875,10 +875,27 @@ class HongGuoSubscribe(_PluginBase):
             return "识别失败"
         # 查询媒体库中是否已存在
         try:
-            exist_flag, _ = DownloadChain().get_no_exists_info(
+            exist_flag, no_exists = DownloadChain().get_no_exists_info(
                 meta=meta, mediainfo=mediainfo
             )
-            if exist_flag:
+            if exist_flag and not no_exists:
+                # 当明确指定了季，但 TMDB 中该季无有效集数信息（如红果短剧
+                # “第十季”在 TMDB 常无集数元数据）时，存在判定不可靠，
+                # 回退到站点搜索下载，避免漏下站点实际存在的资源
+                unreliable = []
+                if meta.season_list:
+                    seasons_map = mediainfo.seasons or {}
+                    unreliable = [
+                        s
+                        for s in meta.season_list
+                        if s not in seasons_map or not seasons_map.get(s)
+                    ]
+                if unreliable:
+                    logger.info(
+                        f"{mediainfo.title_year} 第{unreliable}季缺少有效集数信息，"
+                        f"媒体库存在判定不可靠，改走搜索下载：{title}"
+                    )
+                    return self.__search_download(title)
                 logger.info(f"{mediainfo.title_year} 媒体库中已存在")
                 return "媒体库已存在"
         except Exception as e:
@@ -909,7 +926,13 @@ class HongGuoSubscribe(_PluginBase):
         按标题搜索并下载
         """
         searchchain = SearchChain()
-        contexts = searchchain.search_by_title(title=title)
+        # 搜索词剥离季信息：站点对“持械入宋：第十季”这类完整标题常搜不到，
+        # 用纯剧名搜索后，再由下方标题相关度匹配挑选对应季的资源
+        search_title = re.sub(r"第[零一二两三四五六七八九十百]+季", "", title)
+        search_title = re.sub(r"[\s:：·\-_\[\]（）()【】,，。]+$", "", search_title).strip()
+        if not search_title:
+            search_title = title
+        contexts = searchchain.search_by_title(title=search_title)
         if not contexts:
             logger.warn(f"{title} 未搜索到资源")
             return "未搜索到资源"
@@ -925,11 +948,37 @@ class HongGuoSubscribe(_PluginBase):
         def _norm(s: str) -> str:
             return re.sub(_PUNCT, "", s or "").lower()
 
-        base = _norm(title)
+        # 中文数字季转阿拉伯（如“第十季”→S10），提升与站点 S10/S01 类标题的匹配
+        _CN_NUM = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+                   "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+        def _cn2int(s: str) -> int:
+            total = 0
+            if not s:
+                return 0
+            if "百" in s:
+                idx = s.index("百")
+                total += (_CN_NUM.get(s[idx - 1], 1) * 100 if idx > 0 else 100)
+                s = s[idx + 1:]
+            if "十" in s:
+                idx = s.index("十")
+                tens = _CN_NUM.get(s[idx - 1], 1) if idx > 0 else 1
+                total += tens * 10
+                s = s[idx + 1:]
+                if s:
+                    total += _CN_NUM.get(s[0], 0)
+            elif s:
+                total += _CN_NUM.get(s[-1], 0)
+            return total
+        _seasoned_title = re.sub(
+            r"第([零一二两三四五六七八九十百]+)季",
+            lambda m: f"S{_cn2int(m.group(1))}",
+            title,
+        )
+        base = _norm(_seasoned_title)
         # 中文转拼音全拼（用于匹配拼音/英文种子标题，如 Bei Yong Lian Xi Ren Wan）
         try:
             from pypinyin import lazy_pinyin
-            py_list = lazy_pinyin(title)
+            py_list = lazy_pinyin(_seasoned_title)
             base_py = "".join(py_list).lower()
             # 拼音全拼同样过滤标点（lazy_pinyin 会保留中文标点字符）
             base_py = re.sub(_PUNCT, "", base_py)
@@ -946,6 +995,13 @@ class HongGuoSubscribe(_PluginBase):
             # 拼音全拼匹配：搜索词拼音是种子标题拼音的子串（如 helihouwodainv...）
             if hit <= 0 and len(base_py) >= 4 and base_py in t:
                 hit = max(hit, 0.9)
+            # 拼音剧名前缀 + 季号组合匹配（如 Chi Xie Ru Song 2026 S10 1080p ...）
+            if hit <= 0 and base_py:
+                _s_tag = re.search(r"s\d{1,2}", base)
+                if _s_tag:
+                    _core_py = base_py.split(_s_tag.group(0), 1)[0]
+                    if len(_core_py) >= 3 and _s_tag.group(0) in t and _core_py in t:
+                        hit = max(hit, 0.85)
             # 拼音首字母匹配：搜索词拼音首字母是种子标题子串（如 hlhwodnv...）
             if hit <= 0 and len(initials) >= 3 and initials in t:
                 hit = max(hit, 0.7)
