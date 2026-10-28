@@ -1,6 +1,6 @@
 # MoviePilot-Plugins
 
-自用 MoviePilot 插件仓库，基于 [WChangfei/MoviePilot-Plugins](https://github.com/WChangfei/MoviePilot-Plugins) 同步并修复优化。
+自用 MoviePilot 插件仓库。
 
 ## 插件列表
 
@@ -26,7 +26,6 @@
 - 移除无对应代码的 `HongGuoSubscribe` 无效声明，避免插件市场加载报错
 - 恢复 DoubanRankV3 的豆瓣ID精确识别逻辑，识别失败时自动回退标题匹配，降低误识别率
 - 历史记录查重由列表遍历优化为集合查询，处理大批量榜单时性能提升
-- 补齐作者主页等元信息
 
 ## 目录结构
 
