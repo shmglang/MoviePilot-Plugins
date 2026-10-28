@@ -921,8 +921,15 @@ class HongGuoSubscribe(_PluginBase):
             context.meta_info = MetaInfo(title)
         if not context.media_info:
             media_type = context.meta_info.type
+            # meta_info.type 可能是 MediaType 枚举或字符串（如 "电视剧"/"电影"），兼容处理
+            if isinstance(media_type, MediaType):
+                media_type_value = media_type.value
+            elif media_type and str(media_type) in [t.value for t in MediaType]:
+                media_type_value = str(media_type)
+            else:
+                media_type_value = MediaType.TV.value
             context.media_info = MediaInfo(
-                type=media_type.value if media_type and media_type != MediaType.UNKNOWN else MediaType.TV.value,
+                type=media_type_value,
                 title=context.meta_info.cn_name or context.meta_info.name or title,
                 year=str(context.meta_info.year) if context.meta_info.year else None,
             )
