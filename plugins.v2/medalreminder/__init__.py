@@ -15,6 +15,8 @@ from .handlers import handler_manager
 
 
 class MedalReminder(_PluginBase):
+    # 已拥有状态兼容集合（不同站点 handler 可能输出不同状态值）
+    OWNED_STATUSES = {'已拥有', '已经购买', '拥有'}
     # 插件名称
     plugin_name = "勋章购买提醒"
     # 插件描述
@@ -22,7 +24,7 @@ class MedalReminder(_PluginBase):
     # 插件图标
     plugin_icon = "medalreminder.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "shmglang"
     # 作者主页
@@ -404,8 +406,8 @@ class MedalReminder(_PluginBase):
 
                 for medal in medals:
                     status = (medal.get('purchase_status') or '').strip()
-                    # 统计已拥有
-                    if status == '已拥有':
+                    # 统计已拥有（兼容 "已拥有"/"已经购买"/"拥有" 等状态）
+                    if status in self.OWNED_STATUSES:
                         owned_count += 1
                         site_owned += 1
                         continue

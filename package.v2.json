@@ -12,7 +12,7 @@
     "name": "勋章购买提醒",
     "description": "定时抓取各站点勋章数据，统计勋章数量，推送可购买勋章提醒",
     "labels": "站点",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "medalreminder.png",
     "author": "shmglang",
     "level": 2

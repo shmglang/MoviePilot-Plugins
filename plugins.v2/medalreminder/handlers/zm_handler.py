@@ -82,6 +82,38 @@ class ZmMedalReminderHandler(BaseMedalHandler):
             logger.error(f"处理织梦站点勋章数据时发生错误: {str(e)}")
             return []
 
+    def fetch_user_medals(self, site) -> List[Dict]:
+        """获取织梦站点用户已拥有勋章（复用用户详情页爬取结果）"""
+        try:
+            site_name = site.name
+            site_url = site.url.rstrip('/')
+            site_cookie = site.cookie
+
+            user_id = self._get_user_id(site_url, site_cookie)
+            if not user_id:
+                logger.error(f"无法获取站点 {site_name} 的用户ID")
+                return []
+
+            owned_names, _ = self._get_user_info_from_page(site_url, site_cookie, user_id)
+            if not owned_names:
+                logger.info(f"站点 {site_name} 用户详情页未解析到已拥有勋章")
+                return []
+
+            medals = []
+            for name in sorted(owned_names):
+                medals.append(self._format_medal_data({
+                    'name': name,
+                    'site': site_name,
+                    'purchase_status': '已拥有',
+                    'currency': '电力',
+                    'validity': '',
+                }))
+            logger.info(f"共获取到 {len(medals)} 个 {site_name} 用户已拥有勋章")
+            return medals
+        except Exception as e:
+            logger.error(f"获取织梦站点用户已拥有勋章失败: {e}")
+            return []
+
     def _get_user_id(self, site_url: str, cookies: str) -> str:
         """获取用户ID"""
         try:
@@ -202,8 +234,8 @@ class ZmMedalReminderHandler(BaseMedalHandler):
                 owned_names = set()
 
             # 确定购买状态
-            if has_medal and name in owned_names: 
-                purchase_status = '已经购买'
+            if has_medal and name in owned_names:
+                purchase_status = '已拥有'
             elif self._is_current_time_in_range(sale_begin_time, sale_end_time):
                 if inventory is not None and int(inventory) <= 0:
                      purchase_status = '库存不足'
