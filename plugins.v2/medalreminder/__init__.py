@@ -11,6 +11,7 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.scheduler import Scheduler
 from app.schemas import NotificationType
+from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job
 from .handlers import handler_manager
 
 
@@ -24,7 +25,7 @@ class MedalReminder(_PluginBase):
     # 插件图标
     plugin_icon = "medalreminder.png"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.3"
     # 插件作者
     plugin_author = "shmglang"
     # 作者主页
@@ -47,6 +48,7 @@ class MedalReminder(_PluginBase):
     _use_proxy: bool = True
     _retry_times: int = 3
     _retry_interval: int = 5
+    _onlyonce: bool = False
 
     sites: SitesHelper = None
     siteoper: SiteOper = None
@@ -89,6 +91,7 @@ class MedalReminder(_PluginBase):
                 self._retry_times = self._to_int(config.get("retry_times"), 3)
                 self._retry_interval = self._to_int(config.get("retry_interval"), 5)
                 self._chat_sites = config.get("chat_sites", [])
+                self._onlyonce = self._to_bool(config.get("onlyonce", False))
 
                 # 验证 Cron 表达式
                 cron = config.get("cron") or "0 9 * * *"
@@ -102,6 +105,33 @@ class MedalReminder(_PluginBase):
                 # 过滤掉已删除的站点
                 all_sites = [site.id for site in self.siteoper.list_order_by_pri()] + [site.get("id") for site in self.__custom_sites()]
                 self._chat_sites = [site_id for site_id in self._chat_sites if site_id in all_sites]
+
+            # 立即运行一次（一次性开关）：3 秒后触发一次抓取，结束后复位
+            if self._onlyonce:
+                self._onlyonce = False
+                # 复位 onlyonce 时保留完整配置（update_config 为全量覆盖，不能只传单个字段）
+                self.update_config({
+                    "enabled": self._enabled,
+                    "cron": self._cron,
+                    "notify": self._notify,
+                    "chat_sites": self._chat_sites,
+                    "use_proxy": self._use_proxy,
+                    "retry_times": self._retry_times,
+                    "retry_interval": self._retry_interval,
+                    "onlyonce": False,
+                })
+                registered = add_plugin_once_job(
+                    plugin_id=self.__class__.__name__,
+                    job_id="MedalReminderRunOnce",
+                    func=self.__process_all_sites,
+                    name="勋章购买提醒-立即运行",
+                    delay_seconds=3,
+                    func_kwargs={"force_refresh": True},
+                )
+                if registered:
+                    logger.info(f"{self.plugin_name}: 立即运行一次，将在 3 秒后执行")
+                else:
+                    logger.warning(f"{self.plugin_name}: 立即运行任务未注册，调度器可能未运行")
 
             # 初始化状态日志
             if not self._enabled:
@@ -200,6 +230,20 @@ class MedalReminder(_PluginBase):
                                     }
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "onlyonce",
+                                            "label": "立即运行一次",
+                                            "hint": "保存配置后立即执行一次勋章抓取与提醒",
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     },
                     {
@@ -286,6 +330,7 @@ class MedalReminder(_PluginBase):
         """停止插件服务"""
         try:
             Scheduler().remove_plugin_job("medalreminder")
+            remove_plugin_once_job(self.__class__.__name__, "MedalReminderRunOnce")
             logger.debug(f"{self.plugin_name}: 插件服务已停止")
         except Exception as e:
             logger.debug(f"{self.plugin_name} 停止服务失败: {str(e)}")
@@ -299,7 +344,8 @@ class MedalReminder(_PluginBase):
             "chat_sites": self._chat_sites,
             "use_proxy": self._use_proxy,
             "retry_times": self._retry_times,
-            "retry_interval": self._retry_interval
+            "retry_interval": self._retry_interval,
+            "onlyonce": self._onlyonce
         }
 
     def _get_site_options(self) -> List[Dict[str, Any]]:
