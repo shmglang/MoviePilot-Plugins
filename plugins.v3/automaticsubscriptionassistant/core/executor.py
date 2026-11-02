@@ -280,13 +280,82 @@ class SubscribeExecutor:
         return item.identity()
 
     def _recognize(self, item: RankMediaItem, meta) -> Optional["MediaInfo"]:
-        """按条目通用身份请求宿主识别，缺身份时退化为标题识别。"""
+        """按条目通用身份请求宿主识别，缺身份时退化为标题识别。
+
+        标题识别失败后，再走宿主媒体搜索兜底：候选命中（标题/年份/类型一致）时
+        取其非 TMDB 辅助身份（豆瓣/Bangumi 等）重新识别，弥补 TMDB 未收录场景
+        （如国产新片在 TMDB 无条目，但豆瓣已有收录）。
+        """
         media_source, media_id = item.source_identity()
         if media_source and media_id:
             return self.ctx.chain.recognize_media(
                 meta=meta, media_source=media_source, media_id=media_id,
                 mtype=item.type_hint)
-        return self.ctx.chain.recognize_media(meta=meta)
+        mediainfo = self.ctx.chain.recognize_media(meta=meta)
+        if mediainfo:
+            return mediainfo
+        return self._recognize_with_search_fallback(item, meta)
+
+    def _recognize_with_search_fallback(self, item: RankMediaItem, meta) -> Optional["MediaInfo"]:
+        """标题识别失败后的宿主媒体搜索兜底，仅取匹配候选的非 TMDB 身份重识别。
+
+        仅当候选与榜单条目标题/年份/类型一致时才采用，避免误识别；TMDB 标题识别
+        已失败，故跳过 TMDB 主身份，优先尝试豆瓣、Bangumi 等辅助源。
+        """
+        try:
+            candidates = self.ctx.chain.search_medias(meta=meta) or []
+        except Exception:
+            return None
+        # 先按「标题+类型+年份」严格匹配，未命中时放宽年份再匹配一轮，
+        # 避免同名媒体跨年翻拍误配，同时兼容来源年份口径不一致（如豆瓣 2026 vs 榜单 2025）。
+        for strict_year in (True, False):
+            for candidate in candidates:
+                if not self._candidate_matches(item, candidate, strict_year=strict_year):
+                    continue
+                source, media_id = self._candidate_identity(candidate)
+                if not source or not media_id:
+                    continue
+                try:
+                    mediainfo = self.ctx.chain.recognize_media(
+                        meta=meta, media_source=source, media_id=media_id,
+                        mtype=item.type_hint)
+                except Exception:
+                    continue
+                if mediainfo:
+                    return mediainfo
+        return None
+
+    @staticmethod
+    def _candidate_matches(item: RankMediaItem, candidate: "MediaInfo",
+                           *, strict_year: bool = True) -> bool:
+        """候选与榜单条目标题/年份/类型一致性校验，避免误识别。"""
+        cand_title = (getattr(candidate, "title", None) or "").strip()
+        if not cand_title or cand_title != str(item.title).strip():
+            return False
+        if item.type_hint is not None:
+            cand_type = getattr(candidate, "type", None)
+            if cand_type is not None and cand_type != item.type_hint:
+                return False
+        if strict_year and item.year:
+            cand_year = getattr(candidate, "year", None)
+            if cand_year and str(cand_year).strip() != str(item.year).strip():
+                return False
+        return True
+
+    @staticmethod
+    def _candidate_identity(candidate: "MediaInfo") -> tuple:
+        """从候选提取可用的非 TMDB 身份（优先豆瓣/Bangumi 辅助 ID）。"""
+        source, media_id = resolve_media_identity(candidate)
+        if source and source != MediaSource.TMDB:
+            return source, media_id
+        for field_source, field_name in (
+            (MediaSource.Douban, "douban_id"),
+            (MediaSource.Bangumi, "bangumi_id"),
+        ):
+            value = getattr(candidate, field_name, None)
+            if value is not None and str(value).strip() and str(value).strip() != "0":
+                return field_source, str(value).strip()
+        return None, None
 
     @staticmethod
     def _resolve_identity(media) -> tuple:
