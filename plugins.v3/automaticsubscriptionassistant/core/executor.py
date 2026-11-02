@@ -14,7 +14,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from app.schemas.types import MediaSource, MediaType
 from app.sdk.logging import logger
@@ -34,6 +34,13 @@ if TYPE_CHECKING:
 
 # 历史时间格式。
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _source_value(source) -> Optional[str]:
+    """取 MediaSource 枚举或裸字符串的稳定值（识别失败来源跳过用）。"""
+    if source is None:
+        return None
+    return str(getattr(source, "value", source))
 
 
 class SubscribeExecutor:
@@ -280,57 +287,99 @@ class SubscribeExecutor:
         return item.identity()
 
     def _recognize(self, item: RankMediaItem, meta) -> Optional["MediaInfo"]:
-        """按条目通用身份请求宿主识别，缺身份时退化为标题识别。
+        """按条目通用身份请求宿主识别；失败后依次退化标题识别、宿主媒体搜索兜底。
 
-        标题识别失败后，再走宿主媒体搜索兜底：候选命中（标题/年份/类型一致）时
-        取其非 TMDB 辅助身份（豆瓣/Bangumi 等）重新识别，弥补 TMDB 未收录场景
-        （如国产新片在 TMDB 无条目，但豆瓣已有收录）。
+        兜底顺序：强身份（TMDB/豆瓣/Bangumi 等）→ 标题识别 → 多标题搜索重识别。
+        修正了「强身份存在但宿主识别失败时直接判未识别」的缺陷：强身份识别失败
+        不再立即返回 None，而是继续走标题识别与搜索兜底（如 Mikan 的 Bangumi
+        身份在宿主侧偶发/常态性匹配失败时，仍可借 TMDB/豆瓣标题搜索补回）。
         """
         media_source, media_id = item.source_identity()
+        skipped_sources: set = set()
         if media_source and media_id:
-            return self.ctx.chain.recognize_media(
-                meta=meta, media_source=media_source, media_id=media_id,
-                mtype=item.type_hint)
+            try:
+                mediainfo = self.ctx.chain.recognize_media(
+                    meta=meta, media_source=media_source, media_id=media_id,
+                    mtype=item.type_hint)
+            except Exception:
+                mediainfo = None
+            if mediainfo:
+                return mediainfo
+            skipped_sources.add(_source_value(media_source))
         mediainfo = self.ctx.chain.recognize_media(meta=meta)
         if mediainfo:
             return mediainfo
-        return self._recognize_with_search_fallback(item, meta)
+        return self._recognize_with_search_fallback(item, meta, skipped_sources=skipped_sources)
 
-    def _recognize_with_search_fallback(self, item: RankMediaItem, meta) -> Optional["MediaInfo"]:
-        """标题识别失败后的宿主媒体搜索兜底，仅取匹配候选的非 TMDB 身份重识别。
+    def _recognize_with_search_fallback(self, item: RankMediaItem, meta,
+                                        skipped_sources=frozenset()) -> Optional["MediaInfo"]:
+        """标题识别失败后的宿主媒体搜索兜底，多标题（主标题/原名/别名）逐轮搜索。
 
-        仅当候选与榜单条目标题/年份/类型一致时才采用，避免误识别；TMDB 标题识别
-        已失败，故跳过 TMDB 主身份，优先尝试豆瓣、Bangumi 等辅助源。
+        仅当候选标题与榜单条目任一标题（主标题/原名/别名）、年份、类型一致时才
+        采用，避免误识别；``skipped_sources`` 内的来源（已识别失败）不再尝试。
         """
-        try:
-            candidates = self.ctx.chain.search_medias(meta=meta) or []
-        except Exception:
-            return None
-        # 先按「标题+类型+年份」严格匹配，未命中时放宽年份再匹配一轮，
-        # 避免同名媒体跨年翻拍误配，同时兼容来源年份口径不一致（如豆瓣 2026 vs 榜单 2025）。
-        for strict_year in (True, False):
-            for candidate in candidates:
-                if not self._candidate_matches(item, candidate, strict_year=strict_year):
-                    continue
-                source, media_id = self._candidate_identity(candidate)
-                if not source or not media_id:
-                    continue
-                try:
-                    mediainfo = self.ctx.chain.recognize_media(
-                        meta=meta, media_source=source, media_id=media_id,
-                        mtype=item.type_hint)
-                except Exception:
-                    continue
-                if mediainfo:
-                    return mediainfo
+        titles = self._search_titles(item)
+        for title in titles:
+            try:
+                search_meta = deepcopy(meta)
+                search_meta.title = title
+                candidates = self.ctx.chain.search_medias(meta=search_meta) or []
+            except Exception:
+                continue
+            # 先按「标题+类型+年份」严格匹配，未命中时放宽年份再匹配一轮，
+            # 避免同名媒体跨年翻拍误配，同时兼容来源年份口径不一致（如豆瓣 2026 vs 榜单 2025）。
+            for strict_year in (True, False):
+                for candidate in candidates:
+                    if not self._candidate_matches(item, candidate,
+                                                   strict_year=strict_year, titles=titles):
+                        continue
+                    source, media_id = self._candidate_identity(
+                        candidate, skipped_sources=skipped_sources)
+                    if not source or not media_id:
+                        continue
+                    try:
+                        mediainfo = self.ctx.chain.recognize_media(
+                            meta=meta, media_source=source, media_id=media_id,
+                            mtype=item.type_hint)
+                    except Exception:
+                        continue
+                    if mediainfo:
+                        return mediainfo
         return None
 
     @staticmethod
+    def _search_titles(item: RankMediaItem) -> List[str]:
+        """候选搜索标题序列：主标题 → 原名 → 别名，去空白与重复。
+
+        Mikan 等来源把日文原名/别名放在 ``source_meta``，TMDB/豆瓣搜索命中率
+        往往高于仅用中文主标题，故逐标题兜底搜索。
+        """
+        titles = [str(item.title).strip()] if str(item.title).strip() else []
+        extra = []
+        original_title = item.source_meta.get("original_title") if item.source_meta else None
+        if original_title:
+            extra.append(original_title)
+        extra.extend(item.source_meta.get("aliases") or [])
+        for text in extra:
+            text = str(text).strip()
+            if text and text not in titles:
+                titles.append(text)
+        return titles
+
+    @staticmethod
     def _candidate_matches(item: RankMediaItem, candidate: "MediaInfo",
-                           *, strict_year: bool = True) -> bool:
-        """候选与榜单条目标题/年份/类型一致性校验，避免误识别。"""
+                           *, strict_year: bool = True,
+                           titles: Optional[list] = None) -> bool:
+        """候选与榜单条目标题/年份/类型一致性校验，避免误识别。
+
+        ``titles`` 为候选标题白名单（默认仅主标题；多标题兜底时传全标题序列）。
+        """
         cand_title = (getattr(candidate, "title", None) or "").strip()
-        if not cand_title or cand_title != str(item.title).strip():
+        if not cand_title:
+            return False
+        if titles is None:
+            titles = [str(item.title).strip()]
+        if cand_title not in titles:
             return False
         if item.type_hint is not None:
             cand_type = getattr(candidate, "type", None)
@@ -343,15 +392,28 @@ class SubscribeExecutor:
         return True
 
     @staticmethod
-    def _candidate_identity(candidate: "MediaInfo") -> tuple:
-        """从候选提取可用的非 TMDB 身份（优先豆瓣/Bangumi 辅助 ID）。"""
+    def _candidate_identity(candidate: "MediaInfo",
+                            skipped_sources=frozenset()) -> tuple:
+        """从候选提取可用的重识别身份（优先豆瓣/Bangumi 辅助 ID，跳过已失败来源）。
+
+        ``skipped_sources`` 为已识别失败来源的 ``value`` 集合（如 bangumi），
+        命中时跳过；TMDB 主身份在标题识别失败场景本就不可用，仅当候选只有 TMDB
+        主身份且 TMDB 未被跳过时（如强身份识别失败、标题识别未执行）才回退使用。
+        """
         source, media_id = resolve_media_identity(candidate)
-        if source and source != MediaSource.TMDB:
-            return source, media_id
+        if source and media_id:
+            value = _source_value(source)
+            if value not in skipped_sources:
+                if source != MediaSource.TMDB:
+                    return source, media_id
+                if "themoviedb" not in skipped_sources:
+                    return source, media_id
         for field_source, field_name in (
             (MediaSource.Douban, "douban_id"),
             (MediaSource.Bangumi, "bangumi_id"),
         ):
+            if _source_value(field_source) in skipped_sources:
+                continue
             value = getattr(candidate, field_name, None)
             if value is not None and str(value).strip() and str(value).strip() != "0":
                 return field_source, str(value).strip()

@@ -16,12 +16,13 @@ key 恒为 放送日期/放送开始/官方网站/Bangumi番组计划链接。�
 * ``air_date``：「放送开始」原值。
 * ``original_title`` / ``aliases``：实测 Mikan 信息区并无「原名/别名」字段，故
   ``original_title`` 回退取详情页 ``p.bangumi-title`` 全名（通常比列表标题更完整），
-  ``aliases`` 取「别名/又名」类 key（无则 ``[]``）。二者仅存入 ``source_meta``
-  供历史展示/未来使用；**executor 识别仍只用主标题**（真正用别名做识别需改
-  executor，属另一范畴，本次不动 executor）。
+  ``aliases`` 取「别名/又名」类 key（无则 ``[]``）。二者存入 ``source_meta``，
+  供 executor 多标题兜底识别（主标题识别失败后依次用原名/别名搜索重识别）。
 
-产出 ``bangumi_id``（bgm.tv subject id）时 executor 走宿主通用
-``media_source=bangumi, media_id=...`` 识别；抓不到 bgm id 时退化为 title+year 名称识别。
+产出 ``bangumi_id``（bgm.tv subject id）时 executor 先走宿主通用
+``media_source=bangumi, media_id=...`` 识别；宿主 Bangumi 识别失败时（日志常见
+「未匹配到Bangumi媒体信息」）不再直接判未识别，而是回退标题识别与多标题搜索兜底
+（借 TMDB/豆瓣补回）；抓不到 bgm id 时直接走 title+year 名称识别。
 封面 ``cover`` 同时落到 ``RankMediaItem.poster`` 与 ``source_meta``。
 冷门番若 TMDB 名称匹配不到需注意（见 README 已知限制）。
 """

@@ -60,7 +60,7 @@ class AutomaticSubscriptionAssistant(BlacklistApiMixin, _PluginBase):
     # 插件图标
     plugin_icon = "Auto_Subscribe_Assistant.png"
     # 插件版本
-    plugin_version = "3.3.3"
+    plugin_version = "3.4.0"
     # 插件作者
     plugin_author = "shmglang"
     # 作者主页
