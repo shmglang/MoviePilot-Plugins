@@ -1,4 +1,4 @@
-# 勋章购买提醒（MedalReminder）
+# 勋章购买提醒（medalreminder）
 
 定时抓取 MoviePilot 已配置各站点（PT 站）的勋章数据，统计各站点勋章数量，并通过 MoviePilot 通知渠道推送「当前可购买勋章」提醒。
 

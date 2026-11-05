@@ -1,4 +1,4 @@
-# 红果短剧订阅（HongGuoSubscribe）
+# 红果短剧订阅（hongguosubscribe）
 
 定时抓取红果短剧官网（https://hongguoduanju.com）的热播榜单，获取短剧标题、热度与评分，并按配置自动处理。
 
