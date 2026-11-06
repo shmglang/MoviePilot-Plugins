@@ -12,10 +12,10 @@ from urllib.parse import quote
 
 from app.schemas.types import MediaSource
 
-from .models import media_identity
+from ..schemas import media_identity
 
 if TYPE_CHECKING:
-    from .models import RankMediaItem
+    from ..schemas import RankMediaItem
 
 
 def _normalize_source(media_source):
@@ -111,13 +111,11 @@ class SubscribedIndex:
 
     def __init__(self) -> None:
         self._keys: Dict[str, str] = {}
-        # 宿主订阅行的标题/年份/类型/季索引（跨来源身份漂移时的兜底匹配）。
-        self._titles: Dict[Tuple[str, str, str, Optional[int]], str] = {}
 
     def add_media(self, tmdbid: Optional[int] = None, doubanid: Optional[str] = None,
                   bangumiid: Optional[int] = None, mtype=None, season: Optional[int] = None,
                   title: str = "", year: Optional[str] = None, media_source=None,
-                  media_id=None, episode_group: Optional[str] = None) -> None:
+                  media_id=None, episode_group: Optional[str] = None, music_type=None) -> None:
         """登记一条媒体的全部强身份。
 
         前三个参数是旧调用点的兼容入口；新的宿主订阅行应传
@@ -144,6 +142,14 @@ class SubscribedIndex:
         if not normalized:
             return
 
+        if str(getattr(mtype, "value", mtype)) in {"音乐", "music"}:
+            if music_type not in {"recording", "album"}: return
+            primary_source, primary_id = normalized[0]
+            canonical = media_identity(media_source=primary_source, media_id=primary_id,
+                                       is_music=True, music_type=music_type, title=title, year=year)
+            for source, value in normalized:
+                self._keys.setdefault(f"music:{_source_prefix(source)}:{music_type}:{value}", canonical)
+            return
         is_tv = _is_tv(mtype)
         type_known = _has_type(mtype)
         primary_source, primary_id = normalized[0]
@@ -156,15 +162,14 @@ class SubscribedIndex:
                                     episode_group=episode_group):
                 # 首个登记者定规范身份，保证跨渠道命中回同一条历史记录。
                 self._keys.setdefault(key, canonical)
-        # 标题兜底键：供跨来源身份漂移（识别结果仅带辅助 ID 而宿主订阅为主身份）时
-        # 按标题+年份+类型+季匹配。与强身份键一样，第一个登记者定规范身份。
-        if title and str(title).strip():
-            title_key = (str(title).strip().lower(), str(year or "").strip(),
-                         str(getattr(mtype, "value", mtype) or ""), season)
-            self._titles.setdefault(title_key, canonical)
 
     def _match_key(self, item: "RankMediaItem") -> Optional[str]:
         """返回条目命中的强标识键，未命中返回 None。"""
+        if str(getattr(item.type_hint, "value", item.type_hint)) in {"音乐", "music"}:
+            for source, identity in item.strong_identities():
+                key = f"music:{_source_prefix(source)}:{item.music_type}:{identity}"
+                if key in self._keys: return key
+            return None
         is_tv = _is_tv(item.type_hint)
         type_known = _has_type(item.type_hint)
         for source, media_id in item.strong_identities():
@@ -178,61 +183,6 @@ class SubscribedIndex:
     def contains(self, item: "RankMediaItem") -> bool:
         """条目是否被强标识命中（已订阅 / 本轮已处理）。"""
         return self._match_key(item) is not None
-
-    def contains_media(self, media, season: Optional[int] = None,
-                       episode_group: Optional[str] = None) -> bool:
-        """按识别出的媒体对象全身份检查是否已订阅（跨来源身份归一）。
-
-        宿主订阅行只有单一主身份（如 themoviedb），而识别结果可能同时携带
-        douban / bangumi / imdb / tvdb 等辅助 ID；跨来源时宿主 ``exists`` 的
-        精确判重会 miss，导致同一媒体重复订阅。本方法用媒体对象的全部强身份
-        逐一匹配宿主订阅索引，任一命中即视为已订阅。
-        """
-        if media is None:
-            return False
-        is_tv = _is_tv(getattr(media, "type", None))
-        type_known = _has_type(getattr(media, "type", None))
-        candidates = [
-            (getattr(media, "media_source", None), getattr(media, "media_id", None)),
-            ("themoviedb", getattr(media, "tmdb_id", None)),
-            ("douban", getattr(media, "douban_id", None)),
-            ("bangumi", getattr(media, "bangumi_id", None)),
-            ("imdb", getattr(media, "imdb_id", None)),
-            ("tvdb", getattr(media, "tvdb_id", None)),
-        ]
-        for source, media_id in candidates:
-            for key in _strong_keys(source, media_id, is_tv, season, type_known,
-                                    episode_group=episode_group):
-                if key in self._keys:
-                    return True
-        return False
-
-    def contains_title(self, media, season: Optional[int] = None,
-                       episode_group: Optional[str] = None) -> bool:
-        """按标题/年份/类型/季匹配宿主订阅索引（兜底去重）。
-
-        仅在强身份查重未命中时使用：识别结果可能只带辅助 ID（如 doubanid）而宿主
-        订阅行为另一主身份（themoviedb），此时标题+年份+类型+季一致可视为同一媒体。
-        电影不比较季号；电视剧整剧（season=None）只与整剧订阅匹配，避免误伤跨季。
-        """
-        if media is None:
-            return False
-        title = str(getattr(media, "title", "") or "").strip()
-        if not title:
-            return False
-        year = str(getattr(media, "year", "") or "").strip()
-        is_tv = _is_tv(getattr(media, "type", None))
-        mtype_val = str(getattr(media, "type", "") or "")
-        if not mtype_val:
-            return False
-        if is_tv:
-            keys = [(title.lower(), year, mtype_val, season)]
-        else:
-            keys = [(title.lower(), year, mtype_val, None), (title.lower(), year, mtype_val, 0)]
-        for key in keys:
-            if key in self._titles:
-                return True
-        return False
 
     def identity_for(self, item: "RankMediaItem") -> Optional[str]:
         """命中时返回其规范媒体身份键（用于跨渠道合并历史记录），否则 None。"""
@@ -258,6 +208,7 @@ def build_subscribed_index(subscriptions: Iterable) -> SubscribedIndex:
                 media_source=source,
                 media_id=media_id,
                 mtype=getattr(sub, "type", None),
+                music_type=getattr(sub, "music_type", None),
                 season=getattr(sub, "season", None),
                 episode_group=getattr(sub, "episode_group", None),
                 title=getattr(sub, "name", "") or getattr(sub, "title", ""),

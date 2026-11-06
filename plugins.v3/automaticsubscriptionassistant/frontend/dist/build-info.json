@@ -1,0 +1,27 @@
+{
+  "pluginId": "AutomaticSubscriptionAssistant",
+  "pluginVersion": "3.4.2",
+  "builtAt": "2026-11-05T03:07:54.805Z",
+  "remoteEntry": {
+    "file": "assets/remoteEntry.js",
+    "sha256": "1f7d2a85fb07e844e945f3178361d8135bca26d887f0ebddf9ef0228f0a378b3"
+  },
+  "modules": {
+    "Page": {
+      "file": "assets/__federation_expose_Page-C49DXiTp.js",
+      "sha256": "694975e4ea79551f368d39fa2398cc98e9575ca95de8370235a3eabfe402e80a"
+    },
+    "Config": {
+      "file": "assets/__federation_expose_Config-B8R1Dczw.js",
+      "sha256": "c58fcc26ada17823ba04f67474f50acca7a0d0f600fa862ca1d83cacae14cde2"
+    },
+    "Dashboard": {
+      "file": "assets/__federation_expose_Dashboard-DhuGEjQw.js",
+      "sha256": "e61346f04233e6d4da170c56fdc8417a5943595312afe64520a89fbeb4241046"
+    },
+    "AppPage": {
+      "file": "assets/__federation_expose_AppPage-BFXXgMRM.js",
+      "sha256": "de83bc758159ca5bd0181071dc5aee010bcf19d71d7f2b9eb9cd775418bd0d53"
+    }
+  }
+}

@@ -14,33 +14,26 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Optional
 
 from app.schemas.types import MediaSource, MediaType
 from app.sdk.logging import logger
-from app.sdk.media import MetaInfo, resolve_media_identity
+from app.sdk.media import MUSIC_MEDIA_SOURCES, MetaMusic, MetaInfo, resolve_media_identity
 
-from .blacklist import BLACKLIST_LOCK, BlacklistStore
+from ..services.blacklist import BLACKLIST_LOCK
 from .dedup import SubscribedIndex
-from .models import HistoryRecord, RankMediaItem, SubscribeOutcome, SubscribeStatus, media_identity
+from ..schemas import HistoryRecord, RankMediaItem, SubscribeOutcome, SubscribeStatus, media_identity
 
 if TYPE_CHECKING:
-    from app.sdk.media import MediaInfo
+    from app.sdk.media import MediaInfo, MusicInfo
 
     from .config import GlobalConfig
     from .filters import FilterChain
-    from .history import HistoryStore
+    from ..services.history import HistoryStore
     from .provider import ProviderContext, RankProvider
 
 # 历史时间格式。
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
-
-
-def _source_value(source) -> Optional[str]:
-    """取 MediaSource 枚举或裸字符串的稳定值（识别失败来源跳过用）。"""
-    if source is None:
-        return None
-    return str(getattr(source, "value", source))
 
 
 class SubscribeExecutor:
@@ -54,8 +47,9 @@ class SubscribeExecutor:
         self.gcfg = global_config
         self.manual = manual
         self.subscribe_options = dict(subscribe_options or {})
-        self.blacklist = BlacklistStore(getattr(context, "get_data", None),
-                                        getattr(context, "save_data", None))
+        if context.blacklist is None:
+            raise ValueError("订阅执行器必须注入当前实例的黑名单服务")
+        self.blacklist = context.blacklist
         # 已订阅强标识索引（跨渠道 + 与已订阅去重的快速路径）。缺省空索引 → 无快速路径、向后兼容。
         self.index = subscribed_index if subscribed_index is not None else SubscribedIndex()
 
@@ -64,23 +58,49 @@ class SubscribeExecutor:
                 filters_config: dict) -> SubscribeOutcome:
         """处理单条条目，返回落地结果。异常统一转为 ERROR 结果并记历史。"""
         try:
-            return self._process(item, provider, filter_chain, history, filters_config)
+            outcome = self._process(item, provider, filter_chain, history, filters_config)
+            matches = (outcome.item.source_meta or {}).get('matches')
+            if matches and not self._cancelled():
+                try:
+                    history.merge_matches([outcome.item.candidate_key(), outcome.item.identity()], matches)
+                except Exception as exc:  # noqa: BLE001 - 轨迹补充失败不改变订阅结果
+                    if self.ctx.logger:
+                        self.ctx.logger.warning(f"补充规则命中记录失败: {exc}")
+            return outcome
         except Exception as exc:  # noqa: BLE001 - 单条兜底，不应影响整源
             reason = str(exc)
             self._record(history, item.identity(), provider, item, None, None,
                          SubscribeStatus.ERROR, reason)
             return SubscribeOutcome(SubscribeStatus.ERROR, item, reason=reason)
 
+    def _remember_active(self, history, *args):
+        with BLACKLIST_LOCK:
+            if not self._cancelled():
+                history.mark_handled(*args)
+
+    def _cancelled(self):
+        return self.ctx.event is not None and self.ctx.event.is_set()
+
     def _process(self, item, provider, filter_chain, history, filters_config) -> SubscribeOutcome:
+        if self._cancelled():
+            return SubscribeOutcome(SubscribeStatus.ERROR, item, reason="插件已停止，取消本次处理")
         # 在任何快速去重之前解析明确季号；replace 避免修改 provider 的缓存对象。
-        meta = MetaInfo(item.title)
-        if item.season is not None:
-            meta.begin_season = item.season
-        item = replace(item, season=meta.begin_season,
-                       type_hint=(item.type_hint or (MediaType.TV if meta.begin_season is not None else None)))
+        is_music = item.type_hint == MediaType.MUSIC
+        if is_music:
+            if item.music_type not in {"recording", "album"} or not item.artists:
+                raise ValueError("音乐候选必须包含单曲/专辑类型及艺术家")
+            meta = MetaMusic(title=item.title, artists=item.artists, album=item.album,
+                             music_type=item.music_type, isrc=item.isrc,
+                             year=int(item.year) if item.year and str(item.year).isdigit() else None)
+        else:
+            meta = MetaInfo(item.title)
+            if item.season is not None:
+                meta.begin_season = item.season
+            item = replace(item, season=meta.begin_season,
+                           type_hint=(item.type_hint or (MediaType.TV if meta.begin_season is not None else None)))
         identity = item.identity()
         candidate_key = item.candidate_key()
-        candidate_is_exact = item.type_hint == MediaType.MOVIE or item.season is not None
+        candidate_is_exact = item.type_hint in {MediaType.MOVIE, MediaType.MUSIC} or item.season is not None
 
         if self.blacklist.match(item):
             return self._blocked(item, provider, history)
@@ -92,9 +112,9 @@ class SubscribeExecutor:
             if not history.is_handled(canonical):
                 self._record(history, canonical, provider, item, None, None,
                              SubscribeStatus.SUBSCRIPTION_EXISTS, "已订阅（预去重，跳过识别）")
-                history.mark_handled(canonical)
+                self._remember_active(history, canonical)
             if candidate_is_exact:
-                history.mark_handled(candidate_key, canonical, provider.provider_id)
+                self._remember_active(history, candidate_key, canonical, provider.provider_id)
             return SubscribeOutcome(SubscribeStatus.SUBSCRIPTION_EXISTS, item,
                                     reason="已订阅（预去重，跳过识别）")
 
@@ -112,7 +132,7 @@ class SubscribeExecutor:
             return SubscribeOutcome(SubscribeStatus.FILTERED, item, reason=verdict.reason)
 
         # 4. 识别。
-        if item.year:
+        if item.year and not is_music:
             meta.year = item.year
         if item.type_hint:
             meta.type = item.type_hint
@@ -121,6 +141,8 @@ class SubscribeExecutor:
         if item.episode_group:
             meta.episode_group = item.episode_group
         mediainfo = self._recognize(item, meta)
+        if self._cancelled():
+            return SubscribeOutcome(SubscribeStatus.ERROR, item, reason="插件已停止，取消本次处理")
         if mediainfo is None:
             self._record(history, identity, provider, item, None, None,
                          SubscribeStatus.UNRECOGNIZED, "未识别到媒体信息")
@@ -173,7 +195,7 @@ class SubscribeExecutor:
         # 原始榜单身份可能与宿主规范身份不同，识别后仍须查持久成功状态。
         if not self.manual and history.is_handled(rid):
             if candidate_is_exact:
-                history.mark_handled(candidate_key, rid, provider.provider_id)
+                self._remember_active(history, candidate_key, rid, provider.provider_id)
             return SubscribeOutcome(SubscribeStatus.ALREADY_HANDLED, item, mediainfo=mediainfo)
 
         # 5. post 过滤（识别后）。同样记录但不标记已处理。
@@ -185,6 +207,8 @@ class SubscribeExecutor:
 
         # 6. 媒体库查重：未允许已有媒体时，完整存在的目标季才短路。
         exist_flag, _ = self.ctx.downloadchain.get_no_exists_info(meta=meta, mediainfo=mediainfo)
+        if self._cancelled():
+            return SubscribeOutcome(SubscribeStatus.ERROR, item, reason="插件已停止，取消本次处理")
         if exist_flag and not self.gcfg.exist_ok:
             self._record(history, rid, provider, item, mediainfo, sub_season if is_tv else None,
                          SubscribeStatus.MEDIA_EXISTS, "媒体库已存在")
@@ -193,19 +217,10 @@ class SubscribeExecutor:
             return SubscribeOutcome(SubscribeStatus.MEDIA_EXISTS, item, mediainfo=mediainfo, reason="媒体库已存在")
 
         # 7. 订阅查重（保留：预去重只是快速路径，此处仍是最终安全网）。
-        # 7.1 多身份归一查重：宿主 exists 按主身份精确匹配，跨来源（tmdb↔douban↔bangumi）
-        #     时识别结果主身份可能与宿主订阅行不一致，用全部辅助 ID 再查一遍宿主订阅索引。
-        if not self.manual and (self.index.contains_media(
-                mediainfo, season=sub_season if is_tv else None, episode_group=episode_group)
-                or self.index.contains_title(
-                mediainfo, season=sub_season if is_tv else None, episode_group=episode_group)):
-            self._record(history, rid, provider, item, mediainfo, sub_season if is_tv else None,
-                         SubscribeStatus.SUBSCRIPTION_EXISTS, "订阅已存在（身份归一）")
-            self._mark_done(history, rid, mediainfo, sub_season if is_tv else None,
-                            episode_group)
-            return SubscribeOutcome(SubscribeStatus.SUBSCRIPTION_EXISTS, item, mediainfo=mediainfo,
-                                    reason="订阅已存在（身份归一）")
-        if self.ctx.subscribechain.exists(mediainfo=mediainfo, meta=meta):
+        subscription_exists = self.ctx.subscribechain.exists(mediainfo=mediainfo, meta=meta)
+        if self._cancelled():
+            return SubscribeOutcome(SubscribeStatus.ERROR, item, reason="插件已停止，取消本次处理")
+        if subscription_exists:
             self._record(history, rid, provider, item, mediainfo, sub_season if is_tv else None,
                          SubscribeStatus.SUBSCRIPTION_EXISTS, "订阅已存在")
             self._mark_done(history, rid, mediainfo, sub_season if is_tv else None,
@@ -221,6 +236,8 @@ class SubscribeExecutor:
                          SubscribeStatus.ERROR, reason)
             return SubscribeOutcome(SubscribeStatus.ERROR, item, mediainfo=mediainfo, reason=reason)
         with BLACKLIST_LOCK:
+            if self._cancelled():
+                return SubscribeOutcome(SubscribeStatus.ERROR, item, reason="插件已停止，取消本次订阅")
             if (self.blacklist.match(item)
                     or self.blacklist.match(mediainfo, season=sub_season if is_tv else None)):
                 return self._blocked(item, provider, history, mediainfo,
@@ -238,15 +255,15 @@ class SubscribeExecutor:
                 username=self.gcfg.username,
                 **self.subscribe_options,
             )
-        if sid:
-            self._record(history, rid, provider, item, mediainfo, sub_season,
-                         SubscribeStatus.SUBSCRIBED, None, subscribe_id=sid)
-            self._mark_done(history, rid, mediainfo, sub_season if is_tv else None,
-                            episode_group)
-            return SubscribeOutcome(SubscribeStatus.SUBSCRIBED, item, mediainfo=mediainfo,
-                                    subscribe_id=sid, message=err)
-        self._record(history, rid, provider, item, mediainfo, sub_season, SubscribeStatus.ERROR, err)
-        return SubscribeOutcome(SubscribeStatus.ERROR, item, mediainfo=mediainfo, reason=err)
+            if sid:
+                self._record(history, rid, provider, item, mediainfo, sub_season,
+                             SubscribeStatus.SUBSCRIBED, None, subscribe_id=sid)
+                self._mark_done(history, rid, mediainfo, sub_season if is_tv else None,
+                                episode_group)
+                return SubscribeOutcome(SubscribeStatus.SUBSCRIBED, item, mediainfo=mediainfo,
+                                        subscribe_id=sid, message=err)
+            self._record(history, rid, provider, item, mediainfo, sub_season, SubscribeStatus.ERROR, err)
+            return SubscribeOutcome(SubscribeStatus.ERROR, item, mediainfo=mediainfo, reason=err)
 
     def _blocked(self, item, provider, history, mediainfo=None, season=None, identity=None):
         reason = "已加入黑名单，忽略自动订阅"
@@ -257,16 +274,17 @@ class SubscribeExecutor:
 
     def _mark_done(self, history, identity, mediainfo, season, episode_group=None) -> None:
         """正向终态收尾：标记已处理并登记进已订阅索引，供本轮后续渠道跳过。"""
-        history.mark_handled(identity)
+        self._remember_active(history, identity)
         media_source, media_id = self._resolve_identity(mediainfo)
         self.index.add_media(
             media_source=media_source,
             media_id=media_id,
-            tmdbid=mediainfo.tmdb_id,
-            doubanid=mediainfo.douban_id,
+            tmdbid=getattr(mediainfo, "tmdb_id", None),
+            doubanid=getattr(mediainfo, "douban_id", None),
             bangumiid=getattr(mediainfo, "bangumi_id", None),
             episode_group=episode_group or getattr(mediainfo, "episode_group", None),
             mtype=mediainfo.type,
+            music_type=getattr(mediainfo, "music_type", None),
             season=season,
             title=mediainfo.title,
             year=mediainfo.year,
@@ -279,145 +297,35 @@ class SubscribeExecutor:
             is_tv = mediainfo.type == MediaType.TV if mediainfo.type else False
             media_source, media_id = SubscribeExecutor._resolve_identity(mediainfo)
             return media_identity(
-                tmdb_id=mediainfo.tmdb_id, douban_id=mediainfo.douban_id,
+                tmdb_id=getattr(mediainfo, "tmdb_id", None), douban_id=getattr(mediainfo, "douban_id", None),
                 bangumi_id=getattr(mediainfo, "bangumi_id", None),
                 media_source=media_source, media_id=media_id,
                 is_tv=is_tv, season=season, title=mediainfo.title, year=mediainfo.year,
-                episode_group=getattr(mediainfo, "episode_group", None) or item.episode_group)
+                episode_group=getattr(mediainfo, "episode_group", None) or item.episode_group,
+                is_music=mediainfo.type == MediaType.MUSIC, music_type=getattr(mediainfo, "music_type", None),
+                artists=getattr(mediainfo, "artists", []))
         return item.identity()
 
     def _recognize(self, item: RankMediaItem, meta) -> Optional["MediaInfo"]:
-        """按条目通用身份请求宿主识别；失败后依次退化标题识别、宿主媒体搜索兜底。
-
-        兜底顺序：强身份（TMDB/豆瓣/Bangumi 等）→ 标题识别 → 多标题搜索重识别。
-        修正了「强身份存在但宿主识别失败时直接判未识别」的缺陷：强身份识别失败
-        不再立即返回 None，而是继续走标题识别与搜索兜底（如 Mikan 的 Bangumi
-        身份在宿主侧偶发/常态性匹配失败时，仍可借 TMDB/豆瓣标题搜索补回）。
-        """
+        """按条目通用身份请求宿主识别，缺身份时退化为标题识别。"""
+        if item.type_hint == MediaType.MUSIC:
+            source, identity = item.source_identity()
+            identity_args = {"media_source": source, "media_id": identity} if source in MUSIC_MEDIA_SOURCES and identity else {}
+            recognized = self.ctx.chain.recognize_media(meta=meta, mtype=MediaType.MUSIC, music_type=item.music_type, **identity_args)
+            if recognized is None or recognized.type != MediaType.MUSIC or getattr(recognized, "music_type", None) != item.music_type:
+                return None
+            def normalize(value):
+                return " ".join(str(value).casefold().split())
+            expected = {normalize(name) for name in item.artists}
+            actual = {normalize(name) for name in [*getattr(recognized, "artists", []), *getattr(recognized, "artist_aliases", [])]}
+            isrc_match = bool(item.isrc and item.isrc == getattr(recognized, "isrc", None))
+            return recognized if isrc_match or expected & actual else None
         media_source, media_id = item.source_identity()
-        skipped_sources: set = set()
         if media_source and media_id:
-            try:
-                mediainfo = self.ctx.chain.recognize_media(
-                    meta=meta, media_source=media_source, media_id=media_id,
-                    mtype=item.type_hint)
-            except Exception:
-                mediainfo = None
-            if mediainfo:
-                return mediainfo
-            skipped_sources.add(_source_value(media_source))
-        mediainfo = self.ctx.chain.recognize_media(meta=meta)
-        if mediainfo:
-            return mediainfo
-        return self._recognize_with_search_fallback(item, meta, skipped_sources=skipped_sources)
-
-    def _recognize_with_search_fallback(self, item: RankMediaItem, meta,
-                                        skipped_sources=frozenset()) -> Optional["MediaInfo"]:
-        """标题识别失败后的宿主媒体搜索兜底，多标题（主标题/原名/别名）逐轮搜索。
-
-        仅当候选标题与榜单条目任一标题（主标题/原名/别名）、年份、类型一致时才
-        采用，避免误识别；``skipped_sources`` 内的来源（已识别失败）不再尝试。
-        """
-        titles = self._search_titles(item)
-        for title in titles:
-            try:
-                search_meta = deepcopy(meta)
-                search_meta.title = title
-                candidates = self.ctx.chain.search_medias(meta=search_meta) or []
-            except Exception:
-                continue
-            # 先按「标题+类型+年份」严格匹配，未命中时放宽年份再匹配一轮，
-            # 避免同名媒体跨年翻拍误配，同时兼容来源年份口径不一致（如豆瓣 2026 vs 榜单 2025）。
-            for strict_year in (True, False):
-                for candidate in candidates:
-                    if not self._candidate_matches(item, candidate,
-                                                   strict_year=strict_year, titles=titles):
-                        continue
-                    source, media_id = self._candidate_identity(
-                        candidate, skipped_sources=skipped_sources)
-                    if not source or not media_id:
-                        continue
-                    try:
-                        mediainfo = self.ctx.chain.recognize_media(
-                            meta=meta, media_source=source, media_id=media_id,
-                            mtype=item.type_hint)
-                    except Exception:
-                        continue
-                    if mediainfo:
-                        return mediainfo
-        return None
-
-    @staticmethod
-    def _search_titles(item: RankMediaItem) -> List[str]:
-        """候选搜索标题序列：主标题 → 原名 → 别名，去空白与重复。
-
-        Mikan 等来源把日文原名/别名放在 ``source_meta``，TMDB/豆瓣搜索命中率
-        往往高于仅用中文主标题，故逐标题兜底搜索。
-        """
-        titles = [str(item.title).strip()] if str(item.title).strip() else []
-        extra = []
-        original_title = item.source_meta.get("original_title") if item.source_meta else None
-        if original_title:
-            extra.append(original_title)
-        extra.extend(item.source_meta.get("aliases") or [])
-        for text in extra:
-            text = str(text).strip()
-            if text and text not in titles:
-                titles.append(text)
-        return titles
-
-    @staticmethod
-    def _candidate_matches(item: RankMediaItem, candidate: "MediaInfo",
-                           *, strict_year: bool = True,
-                           titles: Optional[list] = None) -> bool:
-        """候选与榜单条目标题/年份/类型一致性校验，避免误识别。
-
-        ``titles`` 为候选标题白名单（默认仅主标题；多标题兜底时传全标题序列）。
-        """
-        cand_title = (getattr(candidate, "title", None) or "").strip()
-        if not cand_title:
-            return False
-        if titles is None:
-            titles = [str(item.title).strip()]
-        if cand_title not in titles:
-            return False
-        if item.type_hint is not None:
-            cand_type = getattr(candidate, "type", None)
-            if cand_type is not None and cand_type != item.type_hint:
-                return False
-        if strict_year and item.year:
-            cand_year = getattr(candidate, "year", None)
-            if cand_year and str(cand_year).strip() != str(item.year).strip():
-                return False
-        return True
-
-    @staticmethod
-    def _candidate_identity(candidate: "MediaInfo",
-                            skipped_sources=frozenset()) -> tuple:
-        """从候选提取可用的重识别身份（优先豆瓣/Bangumi 辅助 ID，跳过已失败来源）。
-
-        ``skipped_sources`` 为已识别失败来源的 ``value`` 集合（如 bangumi），
-        命中时跳过；TMDB 主身份在标题识别失败场景本就不可用，仅当候选只有 TMDB
-        主身份且 TMDB 未被跳过时（如强身份识别失败、标题识别未执行）才回退使用。
-        """
-        source, media_id = resolve_media_identity(candidate)
-        if source and media_id:
-            value = _source_value(source)
-            if value not in skipped_sources:
-                if source != MediaSource.TMDB:
-                    return source, media_id
-                if "themoviedb" not in skipped_sources:
-                    return source, media_id
-        for field_source, field_name in (
-            (MediaSource.Douban, "douban_id"),
-            (MediaSource.Bangumi, "bangumi_id"),
-        ):
-            if _source_value(field_source) in skipped_sources:
-                continue
-            value = getattr(candidate, field_name, None)
-            if value is not None and str(value).strip() and str(value).strip() != "0":
-                return field_source, str(value).strip()
-        return None, None
+            return self.ctx.chain.recognize_media(
+                meta=meta, media_source=media_source, media_id=media_id,
+                mtype=item.type_hint)
+        return self.ctx.chain.recognize_media(meta=meta)
 
     @staticmethod
     def _resolve_identity(media) -> tuple:
@@ -453,17 +361,20 @@ class SubscribeExecutor:
         record = HistoryRecord(
             unique=unique,
             candidate_key=(item.candidate_key() if item.season is not None or
-                           (mediainfo and mediainfo.type == MediaType.MOVIE) else None),
+                           (mediainfo and mediainfo.type in {MediaType.MOVIE, MediaType.MUSIC}) else None),
             source_item=item.to_dict(),
             provider=provider.provider_id,
             title=mediainfo.title if mediainfo else item.title,
-            year=mediainfo.year if mediainfo else item.year,
+            music_type=getattr(mediainfo, "music_type", None) if mediainfo else item.music_type,
+            artists=list(getattr(mediainfo, "artists", []) if mediainfo else item.artists),
+            album=getattr(mediainfo, "album", None) if mediainfo else item.album,
+            year=str(mediainfo.year) if mediainfo and mediainfo.year is not None else item.year,
             # 类型标注：优先用识别结果，未识别则回退来源自带的 type_hint（榜单已知电影/剧集），
             # 确保每条历史都带类型、可按电影/剧集筛选。
             type=((mediainfo.type.value if mediainfo and mediainfo.type else None)
                   or (item.type_hint.value if item and item.type_hint else "")),
-            tmdbid=mediainfo.tmdb_id if mediainfo else item.tmdb_id,
-            doubanid=mediainfo.douban_id if mediainfo else item.douban_id,
+            tmdbid=getattr(mediainfo, "tmdb_id", None) if mediainfo else item.tmdb_id,
+            doubanid=getattr(mediainfo, "douban_id", None) if mediainfo else item.douban_id,
             # 增存 bangumi id：供「重新识别」无损重建 mikan/番剧候选（识别链按 bangumiid 命中）。
             bangumiid=(getattr(mediainfo, "bangumi_id", None) if mediainfo else item.bangumi_id),
             media_source=media_source,
@@ -475,4 +386,6 @@ class SubscribeExecutor:
             reason=reason,
             time=datetime.now().strftime(TIME_FORMAT),
         )
-        history.record(record)
+        with BLACKLIST_LOCK:
+            if not self._cancelled():
+                history.record(record)
