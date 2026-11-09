@@ -57,6 +57,170 @@ def _single_instance(func):
     return wrapper
 
 
+# ==================== 标题归一化 / 拼音工具 ====================
+
+# 需要剥离的标点与空白（中英文）
+_PUNCT_RE = re.compile(r"[\s:：·\-_\[\]（）()【】,，。.!！?？、;；'\"“”‘’…~～/\\|+&#@*]+")
+
+# 中文数字映射
+_CN_NUM = {
+    "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+}
+
+# 季号（s1 / s01 / s10）
+_SEASON_RE = re.compile(r"s(\d{1,2})(?!\d)")
+
+# 拼音库状态：None=未尝试，callable=可用，False=不可用
+_PINYIN_STATE = None
+
+
+def _cn2int(text: str) -> int:
+    """中文数字转整数，如 十->10、二十三->23、一百->100"""
+    total = 0
+    if not text:
+        return 0
+    if "百" in text:
+        idx = text.index("百")
+        total += (_CN_NUM.get(text[idx - 1], 1) * 100 if idx > 0 else 100)
+        text = text[idx + 1:]
+    if "十" in text:
+        idx = text.index("十")
+        tens = _CN_NUM.get(text[idx - 1], 1) if idx > 0 else 1
+        total += tens * 10
+        text = text[idx + 1:]
+        if text:
+            total += _CN_NUM.get(text[0], 0)
+    elif text:
+        total += _CN_NUM.get(text[-1], 0)
+    return total
+
+
+def _load_pinyin():
+    """加载拼音转换函数，优先使用插件内置 _vendor 目录（避免宿主依赖缺失）"""
+    global _PINYIN_STATE
+    if _PINYIN_STATE is not None:
+        return _PINYIN_STATE
+    try:
+        from pypinyin import lazy_pinyin as _lp
+        _PINYIN_STATE = _lp
+        return _PINYIN_STATE
+    except Exception:
+        pass
+    try:
+        import sys as _sys
+        _vendor = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_vendor")
+        if os.path.isdir(_vendor) and _vendor not in _sys.path:
+            _sys.path.insert(0, _vendor)
+        from pypinyin import lazy_pinyin as _lp
+        _PINYIN_STATE = _lp
+        logger.info("已加载插件内置拼音库（_vendor/pypinyin）")
+        return _PINYIN_STATE
+    except Exception as e:
+        _PINYIN_STATE = False
+        logger.warn(f"拼音库不可用，拼音检索与拼音匹配已降级：{e}")
+        return False
+
+
+def _py_syllables(text: str):
+    """返回 (音节列表, 全拼串, 首字母串)，拼音不可用时返回空"""
+    lp = _load_pinyin()
+    if not lp:
+        return [], "", ""
+    try:
+        raw = lp(text)
+    except Exception:
+        return [], "", ""
+    syls = [re.sub(r"[^a-z0-9]", "", (s or "").lower()) for s in raw]
+    syls = [s for s in syls if s]
+    return syls, "".join(syls), "".join(s[0] for s in syls)
+
+
+def _to_season_tag(text: str) -> str:
+    """把中文/阿拉伯季词统一成 S 标记：第五季 -> S5、第5季 -> S5、Season 5 -> S5"""
+    s = text or ""
+    s = re.sub(r"第([零一二两三四五六七八九十百]+)季",
+               lambda m: f"S{_cn2int(m.group(1))}", s)
+    s = re.sub(r"season\s*(\d{1,3})", r"S\1", s, flags=re.IGNORECASE)
+    s = re.sub(r"(?:第\s*)?(\d{1,2})\s*季", r"S\1", s)
+    return s
+
+
+def _normalize_title(text: str, keep_sep: bool = False) -> str:
+    """
+    标题归一化：中文季词转 S 标记、英文 Season 转 S、去标点空白、转小写
+    keep_sep=True 时把标点/空白统一替换为分隔符 §，避免“S01 1080p”去空格后
+    粘成 s011080p 导致季号无法识别
+    """
+    s = _to_season_tag(text)
+    if keep_sep:
+        return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "\u00a7", s.lower())
+    return _PUNCT_RE.sub("", s).lower()
+
+
+def _season_pad(text: str) -> str:
+    """季号补零：s5 -> s05，便于 s5 / s05 / S5 统一比较"""
+    return _SEASON_RE.sub(lambda m: "s" + m.group(1).zfill(2), text or "")
+
+
+def _seasons_of(text: str) -> set:
+    """提取标题中的季号集合（已补零比较）"""
+    return {int(x) for x in _SEASON_RE.findall(_season_pad(text or ""))}
+
+
+def _match_score(target_title: str, torrent_title: str) -> float:
+    """
+    计算红果剧名与站点种子标题的匹配分（0 表示不匹配）
+    覆盖：中文直配、拼音全拼、拼音前缀、拼音近似、拼音首字母
+    并做季号校验，避免把 S01 资源当作 S05 下载
+    """
+    if not target_title or not torrent_title:
+        return 0.0
+    base = _season_pad(_normalize_title(target_title))
+    cand = _season_pad(_normalize_title(torrent_title))
+    if not base or not cand:
+        return 0.0
+
+    target_seasons = _seasons_of(_normalize_title(target_title, keep_sep=True))
+    cand_seasons = _seasons_of(_normalize_title(torrent_title, keep_sep=True))
+    # 目标指定季，种子也标了季，但毫无交集 -> 视为不匹配（防错季）
+    if target_seasons and cand_seasons and not (target_seasons & cand_seasons):
+        return 0.0
+
+    # 1) 中文标题直接包含
+    if base in cand:
+        return 1.0
+    core_cn = _SEASON_RE.sub("", base)
+    if len(core_cn) >= 4 and core_cn in cand:
+        return 0.9
+
+    # 2) 拼音全拼匹配（先转 S 标记，避免“第十季”被转成 diwuji 而非 s10）
+    _, py, initials = _py_syllables(_to_season_tag(target_title))
+    core_py = re.sub(r"s\d{1,2}", "", py or "")
+    initials = re.sub(r"s\d{1,2}", "", initials or "")
+    if len(core_py) >= 4:
+        if core_py in cand:
+            return 0.95
+        if cand.startswith(core_py):
+            return 0.92
+        head = cand[: len(core_py) + 8]
+        if difflib.SequenceMatcher(None, core_py, head).ratio() >= 0.9:
+            return 0.85
+        sm = difflib.SequenceMatcher(None, core_py, cand)
+        if sm.ratio() >= 0.82:
+            # 覆盖率约束：目标拼音核心要被候选标题基本完整覆盖，
+            # 避免“同系列相似剧名”因长标题稀释比值而误配
+            cover = sm.find_longest_match(0, len(core_py), 0, len(cand)).size
+            if cover >= len(core_py) * 0.9:
+                return 0.8
+
+    # 3) 拼音首字母（长度 >= 6 才启用，避免短串误命中）
+    if len(initials) >= 6 and initials in cand:
+        return 0.75
+
+    return 0.0
+
+
 class HongGuoSubscribe(_PluginBase):
     # 插件名称
     plugin_name = "红果短剧订阅"
@@ -65,7 +229,7 @@ class HongGuoSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "hongguo.png"
     # 插件版本
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     # 插件作者
     plugin_author = "shmglang"
     # 作者主页
@@ -94,6 +258,8 @@ class HongGuoSubscribe(_PluginBase):
     _title_blacklist = []
     _clear = False
     _clearflag = False
+    # 拼音检索增强：站点短剧资源多为拼音命名，开启可显著提升命中率
+    _pinyin_search = True
 
     # 内置榜单地址（红果短剧官网）
     _rank_address = {
@@ -146,6 +312,8 @@ class HongGuoSubscribe(_PluginBase):
                     self._title_blacklist = title_blacklist_str
             else:
                 self._title_blacklist = []
+            pinyin_search = config.get("pinyin_search")
+            self._pinyin_search = True if pinyin_search is None else bool(pinyin_search)
             self._clear = config.get("clear")
 
         # 停止现有任务
@@ -432,6 +600,21 @@ class HongGuoSubscribe(_PluginBase):
                                     }
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "pinyin_search",
+                                            "label": "拼音检索",
+                                            "hint": "站点短剧资源多为拼音命名，开启后可显著提升命中率",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     },
                 ],
@@ -450,6 +633,7 @@ class HongGuoSubscribe(_PluginBase):
             "min_heat": "",
             "min_vote": "",
             "title_blacklist": "",
+            "pinyin_search": True,
             "clear": False,
         }
         return form, config
@@ -597,6 +781,7 @@ class HongGuoSubscribe(_PluginBase):
                 "min_heat": self._min_heat,
                 "min_vote": self._min_vote,
                 "title_blacklist": ",".join(self._title_blacklist),
+                "pinyin_search": self._pinyin_search,
                 "clear": self._clear,
             }
         )
@@ -923,7 +1108,7 @@ class HongGuoSubscribe(_PluginBase):
 
     def __search_download(self, title: str) -> str:
         """
-        按标题搜索并下载
+        按标题搜索并下载（中文检索 + 拼音检索双通道，标题匹配支持拼音种子）
         """
         searchchain = SearchChain()
         # 搜索词剥离季信息：站点对“持械入宋：第十季”这类完整标题常搜不到，
@@ -932,89 +1117,86 @@ class HongGuoSubscribe(_PluginBase):
         search_title = re.sub(r"[\s:：·\-_\[\]（）()【】,，。]+$", "", search_title).strip()
         if not search_title:
             search_title = title
-        contexts = searchchain.search_by_title(title=search_title)
+
+        # 检索词序列：中文剧名 -> 拼音音节串
+        # 站点（GodDramas/麒麟等）短剧资源多为拼音命名（如 Chong Sheng Chou Xiao Ya ...），
+        # 仅用中文剧名检索必然漏搜，需追加拼音音节串检索
+        queries = [search_title]
+        _syls, _, _ = _py_syllables(search_title)
+        if self._pinyin_search and len(_syls) >= 2:
+            py_query = " ".join(_syls)
+            if py_query.lower().replace(" ", "") != search_title.lower().replace(" ", ""):
+                queries.append(py_query)
+            # 长剧名整串拼音在部分站点检索过窄，追加前 4 音节作为补召回
+            if len(_syls) > 4:
+                queries.append(" ".join(_syls[:4]))
+
+        contexts: List[Any] = []
+        seen = set()
+        used_queries: List[str] = []
+        for idx, query in enumerate(queries):
+            try:
+                result = searchchain.search_by_title(title=query) or []
+            except Exception as e:
+                logger.warn(f"{title} 检索「{query}」异常：{str(e)}")
+                result = []
+            used_queries.append(query)
+            added = 0
+            for c in result:
+                ti = getattr(c, "torrent_info", None)
+                key = (
+                    getattr(ti, "enclosure", None)
+                    or getattr(ti, "title", None)
+                    or id(c)
+                )
+                if key in seen:
+                    continue
+                if len(contexts) >= 800:
+                    break
+                seen.add(key)
+                contexts.append(c)
+                added += 1
+            logger.info(
+                f"{title} 检索「{query}」返回 {len(result)} 条，新增 {added} 条"
+            )
+            # 中文检索结果已能稳定匹配时，跳过后续拼音检索，避免无谓耗时
+            if idx == 0 and contexts:
+                best_now = max(
+                    (
+                        _match_score(
+                            title,
+                            getattr(getattr(c, "torrent_info", None), "title", "") or "",
+                        )
+                        for c in contexts
+                    ),
+                    default=0.0,
+                )
+                if best_now >= 0.95:
+                    break
+
         if not contexts:
-            logger.warn(f"{title} 未搜索到资源")
+            logger.warn(
+                f"{title} 未搜索到资源（检索词：{' / '.join(used_queries)}）"
+            )
             return "未搜索到资源"
         # 过滤无种子信息的空壳结果
         valid = [c for c in contexts if getattr(c, "torrent_info", None)]
         if not valid:
             logger.warn(f"{title} 搜索结果均为空壳（无种子信息）")
             return "未搜索到有效资源"
-        # 标题相关度匹配：优先选标题与搜索词相关的资源
-        # 归一化：去除空白、括号、中英文标点（逗号/句号/感叹号/问号/顿号等），
-        # 避免“婆婆装瘫七年，我高调离婚！”的拼音串残留中文逗号导致匹配失败
-        _PUNCT = r"[\s:：·\-_\[\]（）()【】,，。!！?？、;；'\"“”‘’…~～/\\|]"
-        def _norm(s: str) -> str:
-            return re.sub(_PUNCT, "", s or "").lower()
 
-        # 中文数字季转阿拉伯（如“第十季”→S10），提升与站点 S10/S01 类标题的匹配
-        _CN_NUM = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
-                   "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
-        def _cn2int(s: str) -> int:
-            total = 0
-            if not s:
-                return 0
-            if "百" in s:
-                idx = s.index("百")
-                total += (_CN_NUM.get(s[idx - 1], 1) * 100 if idx > 0 else 100)
-                s = s[idx + 1:]
-            if "十" in s:
-                idx = s.index("十")
-                tens = _CN_NUM.get(s[idx - 1], 1) if idx > 0 else 1
-                total += tens * 10
-                s = s[idx + 1:]
-                if s:
-                    total += _CN_NUM.get(s[0], 0)
-            elif s:
-                total += _CN_NUM.get(s[-1], 0)
-            return total
-        _seasoned_title = re.sub(
-            r"第([零一二两三四五六七八九十百]+)季",
-            lambda m: f"S{_cn2int(m.group(1))}",
-            title,
-        )
-        base = _norm(_seasoned_title)
-        # 中文转拼音全拼（用于匹配拼音/英文种子标题，如 Bei Yong Lian Xi Ren Wan）
-        try:
-            from pypinyin import lazy_pinyin
-            py_list = lazy_pinyin(_seasoned_title)
-            base_py = "".join(py_list).lower()
-            # 拼音全拼同样过滤标点（lazy_pinyin 会保留中文标点字符）
-            base_py = re.sub(_PUNCT, "", base_py)
-            initials = re.sub(
-                r"[^a-z]", "", "".join([p[0] for p in py_list]).lower()
-            )
-        except Exception:
-            base_py, initials = "", ""
+        # 标题相关度匹配：中文直配 / 拼音全拼 / 拼音近似 / 拼音首字母，含季号校验
         scored = []
         for c in valid:
-            t = _norm(getattr(c.torrent_info, "title", ""))
-            # 中文标题包含匹配（如种子标题含中文剧名）
-            hit = 1.0 if (base and base in t) else 0.0
-            # 拼音全拼匹配：搜索词拼音是种子标题拼音的子串（如 helihouwodainv...）
-            if hit <= 0 and len(base_py) >= 4 and base_py in t:
-                hit = max(hit, 0.9)
-            # 拼音剧名前缀 + 季号组合匹配（如 Chi Xie Ru Song 2026 S10 1080p ...）
-            if hit <= 0 and base_py:
-                _s_tag = re.search(r"s\d{1,2}", base)
-                if _s_tag:
-                    _core_py = base_py.split(_s_tag.group(0), 1)[0]
-                    if len(_core_py) >= 3 and _s_tag.group(0) in t and _core_py in t:
-                        hit = max(hit, 0.85)
-            # 拼音首字母匹配：搜索词拼音首字母是种子标题子串（如 hlhwodnv...）
-            if hit <= 0 and len(initials) >= 3 and initials in t:
-                hit = max(hit, 0.7)
-            # difflib 相似度兜底
-            if hit <= 0:
-                ratio = difflib.SequenceMatcher(None, base, t).ratio()
-                if ratio >= 0.6 or (base and t and (base[:2] in t or t[:2] in base)):
-                    hit = max(hit, ratio)
+            hit = _match_score(title, getattr(c.torrent_info, "title", "") or "")
             scored.append((hit, c.torrent_info.size or 0, c))
         scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
         best_hit = scored[0][0]
         if best_hit <= 0:
-            logger.warn(f"{title} 未找到标题匹配的资源，跳过下载（避免误下不相关资源）")
+            logger.warn(
+                f"{title} 未找到标题匹配的资源，跳过下载（候选 {len(valid)} 条，"
+                f"检索词：{' / '.join(used_queries)}）"
+            )
             return "未找到匹配资源"
         context = scored[0][2]
         # 补全媒体与元数据（search_by_title 不识别媒体信息，download_single 校验三字段齐全）
