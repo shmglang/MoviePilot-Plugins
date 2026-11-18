@@ -1,0 +1,7 @@
+[project]
+name = "sitedailystatistic"
+version = "4.0.1"
+description = "站点每日数据统计 的插件依赖清单"
+requires-python = ">=3.12"
+# apscheduler、pytz 等均由宿主运行时提供；HTTP 能力走 app.sdk 封装。
+dependencies = []
